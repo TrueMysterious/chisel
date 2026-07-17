@@ -35,6 +35,7 @@ type Config struct {
 	Auth             string
 	KeepAlive        time.Duration
 	MaxRetryCount    int
+	MinRetryInterval time.Duration
 	MaxRetryInterval time.Duration
 	Server           string
 	Proxy            string
@@ -75,9 +76,6 @@ func NewClient(c *Config) (*Client, error) {
 	if !strings.HasPrefix(c.Server, "http") {
 		c.Server = "http://" + c.Server
 	}
-	if c.MaxRetryInterval < time.Second {
-		c.MaxRetryInterval = 5 * time.Minute
-	}
 	u, err := url.Parse(c.Server)
 	if err != nil {
 		return nil, err
@@ -106,6 +104,18 @@ func NewClient(c *Config) (*Client, error) {
 	}
 	//set default log level
 	client.Logger.Info = true
+	//retry interval defaults; explicit values are honored
+	if c.MinRetryInterval <= 0 {
+		c.MinRetryInterval = time.Second
+	}
+	if c.MaxRetryInterval <= 0 {
+		c.MaxRetryInterval = 5 * time.Minute
+	}
+	if c.MaxRetryInterval < c.MinRetryInterval {
+		client.Infof("max-retry-interval (%s) raised to min-retry-interval (%s)",
+			c.MaxRetryInterval, c.MinRetryInterval)
+		c.MaxRetryInterval = c.MinRetryInterval
+	}
 	//configure tls
 	if u.Scheme == "wss" {
 		tc := &tls.Config{}
@@ -172,6 +182,9 @@ func NewClient(c *Config) (*Client, error) {
 	}
 	//ssh auth and config
 	user, pass := settings.ParseAuth(c.Auth)
+	if c.Auth != "" && user == "" {
+		return nil, fmt.Errorf("invalid auth string, expected <user>:<pass>")
+	}
 	client.sshConfig = &ssh.ClientConfig{
 		User:            user,
 		Auth:            []ssh.AuthMethod{ssh.Password(pass)},
@@ -221,7 +234,9 @@ func (c *Client) verifyServer(hostname string, remote net.Addr, key ssh.PublicKe
 	return nil
 }
 
-// verifyLegacyFingerprint calculates and compares legacy MD5 fingerprints
+// verifyLegacyFingerprint calculates and compares legacy MD5 fingerprints,
+// requiring the full 16-octet colon form (a prefix match would let a
+// truncated fingerprint "verify" against ~1 in 65k keys)
 func (c *Client) verifyLegacyFingerprint(key ssh.PublicKey) error {
 	bytes := md5.Sum(key.Marshal())
 	strbytes := make([]string, len(bytes))
@@ -230,7 +245,7 @@ func (c *Client) verifyLegacyFingerprint(key ssh.PublicKey) error {
 	}
 	got := strings.Join(strbytes, ":")
 	expect := c.config.Fingerprint
-	if !strings.HasPrefix(got, expect) {
+	if got != expect {
 		return fmt.Errorf("Invalid fingerprint (%s)", got)
 	}
 	return nil
@@ -270,10 +285,11 @@ func (c *Client) setProxy(u *url.URL, d *websocket.Dialer) error {
 		}
 		return nil
 	}
-	// SOCKS5 proxy
-	if u.Scheme != "socks" && u.Scheme != "socks5h" {
+	// SOCKS5 proxy. all variants behave identically: DNS is
+	// resolved by the proxy (golang.org/x/net/proxy.SOCKS5)
+	if u.Scheme != "socks" && u.Scheme != "socks5" && u.Scheme != "socks5h" {
 		return fmt.Errorf(
-			"unsupported socks proxy type: %s:// (only socks5h:// or socks:// is supported)",
+			"unsupported socks proxy type: %s:// (only socks://, socks5:// or socks5h:// are supported)",
 			u.Scheme,
 		)
 	}
@@ -291,6 +307,13 @@ func (c *Client) setProxy(u *url.URL, d *websocket.Dialer) error {
 	}
 	d.NetDial = socksDialer.Dial
 	return nil
+}
+
+// Ready blocks until the client has an active connection to the
+// server, returning false if the context is cancelled or the
+// connection wait times out first
+func (c *Client) Ready(ctx context.Context) bool {
+	return c.tunnel.Ready(ctx)
 }
 
 // Wait blocks while the client is running.
